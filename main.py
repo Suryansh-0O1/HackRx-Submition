@@ -1,6 +1,7 @@
 import os
 import requests
 import tempfile
+import uvicorn
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -61,38 +62,92 @@ def create_qa_chain(pdf_url: str):
             temp_file.write(response.content)
             temp_file_path = temp_file.name
 
+        # Load and split the PDF
         loader = PyPDFLoader(temp_file_path)
         docs = loader.load_and_split()
-        os.unlink(temp_file_path)
+        os.unlink(temp_file_path)  # Clean up temp file
 
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        # Split into chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, 
+            chunk_overlap=200,
+            separators=["\n\n", "\n", " ", ""]
+        )
         chunks = text_splitter.split_documents(docs)
 
-        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-
-        # Load the existing index and add the new documents
-        # This will add the new PDF's content to your index without deleting old content.
-        vector_store = PineconeVectorStore.from_documents(
-            chunks, embeddings, index_name=PINECONE_INDEX_NAME
+        # Initialize embeddings
+        embeddings = HuggingFaceEmbeddings(
+            model_name="all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': True}
         )
 
-        retriever = vector_store.as_retriever()
-        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.7)
+        # Connect to existing Pinecone index and add documents
+        from pinecone import Pinecone
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        
+        # Get existing index
+        index = pc.Index(PINECONE_INDEX_NAME)
+        
+        # Create vector store from existing index and add new documents
+        vector_store = PineconeVectorStore(
+            index=index,
+            embedding=embeddings,
+            text_key="text"
+        )
+        
+        # Add the new documents to the existing index
+        vector_store.add_documents(chunks)
 
+        # Create retriever with better parameters
+        retriever = vector_store.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 5}  # Retrieve top 5 most relevant chunks
+        )
+
+        # Initialize LLM with better parameters
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            temperature=0.1,  # Lower temperature for more consistent answers
+            max_tokens=1000
+        )
+
+        # Create QA chain with better prompt
         qa_chain = RetrievalQA.from_chain_type(
             llm=llm,
             retriever=retriever,
-            return_source_documents=False
+            return_source_documents=False,
+            chain_type="stuff"  # Explicitly set chain type
         )
+        
         return qa_chain
 
     except Exception as e:
         print(f"An error occurred in create_qa_chain: {e}")
-        raise HTTPException(status_code=500, detail="Failed to process the document.")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to process the document: {str(e)}")
 
 
-# --- API Endpoint ---
+# --- API Endpoints ---
+@app.get("/")
+async def root():
+    """Root endpoint to check if the API is running."""
+    return {"message": "HackRX API is running!", "status": "healthy"}
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "pinecone_configured": bool(PINECONE_API_KEY),
+        "hackrx_key_configured": bool(HACKRX_API_KEY),
+        "google_api_configured": bool(os.getenv("GOOGLE_API_KEY"))
+    }
+
+# Add both possible endpoint paths to be safe
 @app.post("/hackrx/run", response_model=AnswerPayload, dependencies=[Depends(verify_api_key)])
+@app.post("/api/v1/hackrx/run", response_model=AnswerPayload, dependencies=[Depends(verify_api_key)])
 async def run_hackathon_submission(payload: QueryPayload):
     """
     This is the main endpoint for the hackathon. It receives a document URL
@@ -114,3 +169,16 @@ async def run_hackathon_submission(payload: QueryPayload):
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
         raise HTTPException(status_code=500, detail="An internal server error occurred.")
+
+# Define the same function for the /api/v1/hackrx/run endpoint
+async def run_hackathon_submission_v1(payload: QueryPayload):
+    """Same function but for the v1 API endpoint"""
+    return await run_hackathon_submission(payload)
+
+# For running locally and on Railway
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
+else:
+    # This helps Railway detect the app
+    application = app
